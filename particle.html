@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>PARTICLE</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #050505;
+            font-family: sans-serif;
+            overflow: hidden;
+        }
+
+        #canvas-container {
+            position: absolute;
+            inset: 0;
+            z-index: 1;
+        }
+
+        #preview-container {
+            position: absolute;
+            bottom: 18px;
+            left: 18px;
+            z-index: 20;
+            width: 160px;
+            height: 120px;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #000;
+            border: 1px solid #333;
+            opacity: 0.9;
+            pointer-events: none;
+        }
+
+        #preview-canvas {
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1);
+            display: block;
+        }
+
+        #loading {
+            position: absolute;
+            left: 50%;
+            top: 48%;
+            transform: translate(-50%, -50%);
+            color: #00ffff;
+            font-size: 16px;
+            text-align: center;
+            z-index: 30;
+        }
+
+        #camera-btn {
+            position: absolute;
+            right: 18px;
+            bottom: 18px;
+            z-index: 30;
+            background: rgba(0, 0, 0, 0.6);
+            border: 1px solid #0ff;
+            color: #0ff;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        #camera-btn:active {
+            transform: translateY(1px);
+        }
+    </style>
+
+    <!-- MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <!-- Three import map -->
+    <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+    <div id="canvas-container"></div>
+    <div id="loading">正在初始化...<br><span style="font-size:13px;color:#aaa">请允许摄像头权限（若浏览器未弹窗，请点击右下“启用摄像头”）</span></div>
+    <div id="preview-container"><canvas id="preview-canvas" width="320" height="240"></canvas></div>
+    <button id="camera-btn">启用摄像头</button>
+    <video id="input-video" playsinline style="display:none"></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // ----------------------- 基本场景 -----------------------
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x050505, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 30);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(innerWidth, innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.autoRotate = false;
+
+        // ----------------------- 粒子 shader -----------------------
+        const uniforms = {
+            uTime: { value: 0 },
+            uSize: { value: 4.0 },
+            uColor: { value: new THREE.Color('#00ffff') },
+            uExpansion: { value: 0 } // 用于 GUI 显示
+        };
+
+        const material = new THREE.ShaderMaterial({
+            uniforms,
+            vertexShader: `
+      uniform float uSize;
+      attribute float aScale;
+      varying float vScale;
+      void main() {
+        vScale = aScale;
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = (uSize * aScale) * (100.0 / -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+            fragmentShader: `
+      uniform vec3 uColor;
+      varying float vScale;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        if (d > 0.5) discard;
+        float alpha = 1.0 - smoothstep(0.0, 0.5, d);
+        alpha *= vScale;
+        gl_FragColor = vec4(uColor, alpha);
+      }
+    `,
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+
+        // ----------------------- 形状工厂 -----------------------
+        const ShapeFactory = {
+            Helix: () => {
+                const curve = new THREE.CatmullRomCurve3(Array.from({ length: 300 }, (_, i) => {
+                    const t = i / 50;
+                    return new THREE.Vector3(Math.cos(t) * (5 + t * 0.8), t * 1.2 - 3, Math.sin(t) * (5 + t * 0.8));
+                }));
+                return new THREE.TubeGeometry(curve, 300, 0.15, 8, false);
+            },
+            Galaxy: () => {
+                const pts = [];
+                for (let i = 0; i < 8000; i++) {
+                    const a = Math.random() * Math.PI * 6;
+                    const r = 0.5 + Math.pow(i / 8000, 0.5) * 8;
+                    const y = (Math.random() - 0.5) * 0.4;
+                    pts.push(new THREE.Vector3(Math.cos(a) * r + (Math.random() - 0.5) * 0.5, y, Math.sin(a) * r + (Math.random() - 0.5) * 0.5));
+                }
+                return new THREE.BufferGeometry().setFromPoints(pts);
+            },
+            Wave: () => {
+                const g = new THREE.PlaneGeometry(24, 24, 120, 120);
+                const pos = g.attributes.position.array;
+                for (let i = 0; i < pos.length; i += 3) {
+                    const x = pos[i], y = pos[i + 1];
+                    pos[i + 2] = Math.sin(x * 0.5) * Math.cos(y * 0.5) * 1.5;
+                }
+                g.computeVertexNormals();
+                return g;
+            },
+            Heart: () => {
+                const pts = [];
+                for (let i = 0; i < 6000; i++) {
+                    const t = (i / 6000) * Math.PI * 2;
+                    const x = 16 * Math.pow(Math.sin(t), 3);
+                    const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+                    const z = (Math.random() - 0.5) * 2;
+                    pts.push(new THREE.Vector3(x * 0.25, y * 0.25, z));
+                }
+                return new THREE.BufferGeometry().setFromPoints(pts);
+            },
+            Star: () => {
+                const shape = new THREE.Shape();
+                const outer = 7, inner = 3.2;
+                for (let i = 0; i < 10; i++) {
+                    const angle = (i / 10) * Math.PI * 2;
+                    const r = i % 2 === 0 ? outer : inner;
+                    shape.lineTo(Math.cos(angle) * r, Math.sin(angle) * r);
+                }
+                return new THREE.ExtrudeGeometry(shape, { depth: 2, bevelEnabled: false });
+            },
+            Torus: () => new THREE.TorusKnotGeometry(5, 1.5, 100, 16),
+            Sphere: () => new THREE.SphereGeometry(7, 64, 64),
+            Box: () => new THREE.BoxGeometry(10, 10, 10)
+        };
+
+        // ----------------------- 粒子数据与管理 -----------------------
+        let points = null;
+        const PARTICLE_COUNT = 5000;
+
+        // state arrays (will be replaced on each createParticles call)
+        let restPositions = null;
+        let velocities = null;
+        let tempPositions = null;
+
+        function createParticles(type = 'Torus') {
+            try {
+                // remove old
+                if (points) {
+                    scene.remove(points);
+                    points.geometry.dispose();
+                    points = null;
+                }
+
+                // build base geometry
+                let baseGeo = ShapeFactory[type] ? ShapeFactory[type]() : ShapeFactory.Torus();
+
+                // ensure buffer geometry
+                if (!(baseGeo instanceof THREE.BufferGeometry)) {
+                    baseGeo = new THREE.BufferGeometry().fromGeometry ? new THREE.BufferGeometry().fromGeometry(baseGeo) : baseGeo;
+                }
+
+                // prepare arrays
+                restPositions = new Float32Array(PARTICLE_COUNT * 3);
+                velocities = new Float32Array(PARTICLE_COUNT * 3);
+                tempPositions = new Float32Array(PARTICLE_COUNT * 3);
+                const positions = new Float32Array(PARTICLE_COUNT * 3);
+                const scales = new Float32Array(PARTICLE_COUNT);
+                const randoms = new Float32Array(PARTICLE_COUNT * 3);
+
+                // Try MeshSurfaceSampler if geometry looks like a surface (has index or normal).
+                let sampler = null;
+                try {
+                    const hasSurface = !!(baseGeo.index || baseGeo.attributes.normal);
+                    if (hasSurface) {
+                        const meshTemp = new THREE.Mesh(baseGeo);
+                        sampler = new MeshSurfaceSampler(meshTemp).build();
+                    }
+                } catch (e) {
+                    console.warn('Sampler init failed, will fallback to vertex sampling.', e);
+                    sampler = null;
+                }
+
+                // fallback vertex array if sampler missing
+                const vertexArray = baseGeo.attributes && baseGeo.attributes.position ? baseGeo.attributes.position.array : null;
+                const vertexCount = vertexArray ? (vertexArray.length / 3) : 0;
+
+                const tmp = new THREE.Vector3();
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    if (sampler) {
+                        // safe call in try/catch to prevent crash
+                        try {
+                            sampler.sample(tmp);
+                        } catch (e) {
+                            // fallback
+                            const idx = Math.floor(Math.random() * Math.max(1, vertexCount)) * 3;
+                            tmp.set(vertexArray[idx] || (Math.random() - 0.5) * 6, vertexArray[idx + 1] || (Math.random() - 0.5) * 6, vertexArray[idx + 2] || (Math.random() - 0.5) * 6);
+                        }
+                    } else if (vertexCount > 0) {
+                        const idx = Math.floor(Math.random() * vertexCount) * 3;
+                        tmp.set(vertexArray[idx], vertexArray[idx + 1], vertexArray[idx + 2]);
+                    } else {
+                        // last resort: random point in small ball
+                        tmp.set((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6);
+                    }
+
+                    // tiny jitter for volume
+                    tmp.x += (Math.random() - 0.5) * 0.02;
+                    tmp.y += (Math.random() - 0.5) * 0.02;
+                    tmp.z += (Math.random() - 0.5) * 0.02;
+
+                    positions[i * 3] = tmp.x;
+                    positions[i * 3 + 1] = tmp.y;
+                    positions[i * 3 + 2] = tmp.z;
+
+                    restPositions[i * 3] = tmp.x;
+                    restPositions[i * 3 + 1] = tmp.y;
+                    restPositions[i * 3 + 2] = tmp.z;
+
+                    tempPositions[i * 3] = tmp.x;
+                    tempPositions[i * 3 + 1] = tmp.y;
+                    tempPositions[i * 3 + 2] = tmp.z;
+
+                    velocities[i * 3] = velocities[i * 3 + 1] = velocities[i * 3 + 2] = 0;
+
+                    randoms.set([(Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4], i * 3);
+                    scales[i] = 0.5 + Math.random() * 1.0;
+                }
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                geometry.setAttribute('aRandom', new THREE.BufferAttribute(randoms, 3));
+                geometry.setAttribute('aScale', new THREE.BufferAttribute(scales, 1));
+
+                points = new THREE.Points(geometry, material);
+                scene.add(points);
+
+                // recompute base radius
+                computeBaseRadius();
+
+            } catch (err) {
+                console.error('createParticles failed', err);
+            }
+        }
+
+        // 初始
+        createParticles('Torus');
+
+        // ----------------------- GUI -----------------------
+        const gui = new GUI({ title: '控制面板' });
+        const params = {
+            color: '#00ffff',
+            shape: 'Torus',
+            expansion: 0,
+            size: 4.0,
+            damping: 0.92,
+            repulseStrength: 6.0,
+            restoreK: 0.08,
+            boundaryRadius: 14
+        };
+        gui.addColor(params, 'color').name('粒子颜色').onChange(v => uniforms.uColor.value.set(v));
+        gui.add(params, 'shape', ['Torus', 'Sphere', 'Box', 'Helix', 'Galaxy', 'Wave', 'Heart', 'Star']).name('模型形状').onChange(v => createParticles(v));
+        gui.add(params, 'expansion', 0, 1).name('手势力度').listen().disable();
+        gui.add(params, 'size', 1, 12).name('点大小').onChange(v => uniforms.uSize.value = v);
+        gui.add(params, 'damping', 0.7, 0.995).name('阻尼(越低损失越大)');
+        gui.add(params, 'repulseStrength', 0, 20).name('排斥强度');
+        gui.add(params, 'restoreK', 0.0, 0.5).name('恢复弹性');
+        gui.add(params, 'boundaryRadius', 5, 60).name('边界参考半径');
+
+        // ----------------------- MediaPipe Hands -----------------------
+        const videoElement = document.getElementById('input-video');
+        const previewCanvas = document.getElementById('preview-canvas');
+        const previewCtx = previewCanvas.getContext('2d');
+        let targetExpansion = 0;
+        let handsModule = null;
+        let cameraRunner = null;
+        let handsInstance = null;
+
+        async function initHands() {
+            if (typeof window.Hands === 'undefined') {
+                console.error('MediaPipe Hands 未加载');
+                return;
+            }
+            try {
+                handsInstance = new Hands({
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+                });
+                handsInstance.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+                handsInstance.onResults(onHandsResults);
+            } catch (e) {
+                console.error('Hands init error', e);
+                handsInstance = null;
+            }
+        }
+
+        function onHandsResults(results) {
+            try {
+                previewCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+                previewCtx.drawImage(results.image, 0, 0, previewCanvas.width, previewCanvas.height);
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    const lm = results.multiHandLandmarks[0];
+                    drawConnectors(previewCtx, lm, HAND_CONNECTIONS, { color: '#00ff00', lineWidth: 2 });
+                    const t = lm[4], idx = lm[8];
+                    const dx = t.x - idx.x, dy = t.y - idx.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    let val = (dist - 0.05) / (0.25 - 0.05);
+                    targetExpansion = Math.max(0, Math.min(1, val));
+                    document.getElementById('loading').style.display = 'none';
+                } else {
+                    targetExpansion = 0;
+                }
+            } catch (e) {
+                console.warn('onHandsResults error', e);
+            }
+        }
+
+        async function startCamera() {
+            try {
+                if (!handsInstance) await initHands();
+                if (!handsInstance) throw new Error('Hands 未能初始化');
+
+                // Camera utils may require a user gesture in some browsers.
+                cameraRunner = new Camera(videoElement, {
+                    onFrame: async () => { try { await handsInstance.send({ image: videoElement }); } catch (e) { console.warn('hands send failed', e); } },
+                    width: 320, height: 240
+                });
+
+                await cameraRunner.start();
+                document.getElementById('loading').style.display = 'none';
+                console.log('Camera started');
+            } catch (err) {
+                console.error('startCamera error:', err);
+                // 显示提示但不阻塞主线程
+                document.getElementById('loading').innerText = '摄像头启动失败，请检查浏览器权限或点击右下按钮重试';
+            }
+        }
+
+        // 绑定按钮：方便浏览器需要用户交互时触发权限弹窗
+        document.getElementById('camera-btn').addEventListener('click', async (ev) => {
+            ev.preventDefault();
+            document.getElementById('loading').innerText = '正在请求摄像头权限...';
+            await startCamera();
+        });
+
+        // 此处尝试自动启动（若浏览器允许自动请求）
+        (async () => {
+            try {
+                await initHands();
+                // 尝试直接 startCamera（若浏览器阻止，会由 catch 处理，不影响主渲染）
+                // 有些浏览器需要用户交互才能触发权限提示，所以失败也正常
+                await startCamera();
+            } catch (e) {
+                console.log('自动启动摄像头被阻止或失败（这在某些浏览器是正常的）', e);
+            }
+        })();
+
+        // ----------------------- 物理与相机自适应 -----------------------
+        let baseRadius = 8.0;
+        function computeBaseRadius() {
+            if (!restPositions) return;
+            let sum = 0;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const x = restPositions[i * 3], y = restPositions[i * 3 + 1], z = restPositions[i * 3 + 2];
+                sum += (x * x + y * y + z * z);
+            }
+            baseRadius = Math.sqrt(sum / PARTICLE_COUNT) * 1.2 + 2.0;
+        }
+        computeBaseRadius();
+
+        const clock = new THREE.Clock();
+        function animate() {
+            requestAnimationFrame(animate);
+            const dt = Math.min(clock.getDelta(), 0.033);
+            uniforms.uTime.value += dt;
+
+            // smooth targetExpansion
+            const smoothExp = THREE.MathUtils.lerp(uniforms.uExpansion.value, targetExpansion, 0.12);
+            uniforms.uExpansion.value = smoothExp;
+            params.expansion = smoothExp;
+
+            const gestureStrength = params.repulseStrength * smoothExp;
+
+            physicsStep(dt, gestureStrength);
+            adaptiveCamera();
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function physicsStep(dt, gestureStrength) {
+            if (!points || !restPositions || !velocities || !tempPositions) return;
+            const posAttr = points.geometry.attributes.position;
+            const aRandom = points.geometry.attributes.aRandom;
+            const damping = params.damping;
+            const restoreK = params.restoreK;
+            const R = params.boundaryRadius;
+
+            // local temporaries
+            const tmpPos = new THREE.Vector3();
+            const tmpRest = new THREE.Vector3();
+            const tmpVec = new THREE.Vector3();
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const ix = i * 3;
+                let px = tempPositions[ix], py = tempPositions[ix + 1], pz = tempPositions[ix + 2];
+                let vx = velocities[ix], vy = velocities[ix + 1], vz = velocities[ix + 2];
+
+                tmpPos.set(px, py, pz);
+
+                // 1) 中心排斥
+                const dist = tmpPos.length();
+                if (dist > 1e-5 && gestureStrength > 1e-6) {
+                    const falloff = 1.0 / (1.0 + dist * 0.8);
+                    tmpVec.copy(tmpPos).normalize().multiplyScalar(gestureStrength * falloff * dt);
+                    vx += tmpVec.x; vy += tmpVec.y; vz += tmpVec.z;
+                }
+
+                // 2) 小扰动
+                if (aRandom) {
+                    vx += aRandom.getX(i) * 0.02 * dt;
+                    vy += aRandom.getY(i) * 0.02 * dt;
+                    vz += aRandom.getZ(i) * 0.02 * dt;
+                }
+
+                // 3) 恢复力（弹簧回到 rest）
+                tmpRest.set(restPositions[ix], restPositions[ix + 1], restPositions[ix + 2]);
+                tmpVec.copy(tmpRest).sub(tmpPos).multiplyScalar(restoreK * dt);
+                vx += tmpVec.x; vy += tmpVec.y; vz += tmpVec.z;
+
+                // 4) 边界回弹（如果超过 R）
+                if (dist > R) {
+                    const extra = dist - R;
+                    const inward = tmpPos.clone().normalize().multiplyScalar(-extra * 0.06 * dt);
+                    vx += inward.x; vy += inward.y; vz += inward.z;
+                }
+
+                // 5) 阻尼（随 dt 缩放）
+                const dampingFactor = Math.pow(damping, dt * 60);
+                vx *= dampingFactor; vy *= dampingFactor; vz *= dampingFactor;
+
+                // 6) 更新位置（乘以一个常数以增加响应感）
+                px += vx * dt * 60;
+                py += vy * dt * 60;
+                pz += vz * dt * 60;
+
+                // 写回
+                tempPositions[ix] = px; tempPositions[ix + 1] = py; tempPositions[ix + 2] = pz;
+                velocities[ix] = vx; velocities[ix + 1] = vy; velocities[ix + 2] = vz;
+
+                posAttr.setXYZ(i, px, py, pz);
+            }
+
+            posAttr.needsUpdate = true;
+        }
+
+        function adaptiveCamera() {
+            if (!points) return;
+            const pos = points.geometry.attributes.position;
+            let sum = 0;
+            const step = Math.max(1, Math.floor(PARTICLE_COUNT / 500));
+            let sampleCount = 0;
+            for (let i = 0; i < PARTICLE_COUNT; i += step) {
+                const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+                sum += (x * x + y * y + z * z);
+                sampleCount++;
+            }
+            const avgR = Math.sqrt(sum / sampleCount);
+            const desiredZ = 30 + Math.max(0, (avgR - baseRadius)) * 1.6;
+            camera.position.z += (desiredZ - camera.position.z) * 0.06;
+            camera.lookAt(0, 0, 0);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+
+        animate();
+
+        // 小延迟隐藏 loading（若摄像头未弹窗仍不影响渲染）
+        setTimeout(() => {
+            const el = document.getElementById('loading');
+            if (el) el.style.display = 'none';
+        }, 2500);
+
+    </script>
+</body>
+
+</html>
